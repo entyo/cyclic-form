@@ -17,6 +17,7 @@ import {
     Values,
     ZoomIn,
 } from './types';
+import sampleCombine from 'xstream/extra/sampleCombine';
 
 // re-exports
 export {
@@ -59,6 +60,13 @@ export namespace Options {
         fields: Set<keyof Decl>;
         predicate(e: KeyboardEvent): boolean;
     }>;
+
+    export type HoverSubmitButton<Decl extends FormDeclaration<any>> = Readonly<{
+        submitButtonField: keyof Decl;
+        borderField: keyof Decl;
+        hoveringClassName: string;
+        scrollY$: Stream<number>;
+    }>;
 }
 
 /**
@@ -67,6 +75,7 @@ export namespace Options {
  */
 export type Options<Decl extends FormDeclaration<any>> = Readonly<{
     customSubmission: Options.CustomSubmission<Decl>;
+    hoverSubmitButton: Options.HoverSubmitButton<Decl>;
 }>;
 
 /**
@@ -84,7 +93,15 @@ export type Options<Decl extends FormDeclaration<any>> = Readonly<{
  */
 export function form<Decl extends FormDeclaration<any>>(
     fields: FieldsFor<Decl>,
-    options: Options<Decl> = { customSubmission: { fields: new Set<keyof Decl>(), predicate: defaultPredicate } },
+    options: Options<Decl> = {
+        customSubmission: { fields: new Set<keyof Decl>(), predicate: defaultPredicate },
+        hoverSubmitButton: {
+            borderField: '',
+            submitButtonField: '',
+            hoveringClassName: 'hovering',
+            scrollY$: Stream.empty(),
+        },
+    },
 ): Component<Sources<Decl>, Sinks<Decl>> {
     return function Form({
         DOM,
@@ -110,8 +127,9 @@ export function form<Decl extends FormDeclaration<any>>(
                 ? (DOM as MainDOMSource).isolateSource
                 : (source: DOMSource, _scope: any) => source;
 
-        const { customSubmission } = options;
+        const { customSubmission, hoverSubmitButton } = options;
         const { fields: submissionFields } = customSubmission;
+        const { submitButtonField, borderField, hoveringClassName, scrollY$ } = hoverSubmitButton;
         const { predicate } = customSubmission;
         const customSubmission$ = Stream.merge(
             ...Array.from(submissionFields).map(key =>
@@ -120,6 +138,24 @@ export function form<Decl extends FormDeclaration<any>>(
                     .filter(predicate),
             ),
         );
+
+        const borderHeight$ = (isolateSource(DOM, borderField).element() as MemoryStream<Element>)
+            .map(elem => {
+                const { y, height } = (elem as Element).getBoundingClientRect() as DOMRect;
+                return y + height;
+            })
+            .debug(borderHeight => console.log({ borderHeight }));
+
+        const buttonsRowY$ = (isolateSource(DOM, submitButtonField).element() as MemoryStream<Element>)
+            .map(elem => ((elem as Element).getBoundingClientRect() as DOMRect).y)
+            .debug(buttonsRowY => console.log({ buttonsRowY }));
+
+        const reachedToBottom$ = scrollY$
+            .debug(scrollY => console.log({ scrollY }))
+            .compose(sampleCombine(borderHeight$))
+            .compose(sampleCombine(buttonsRowY$))
+            .map(([[_, borderHeight], buttonsRowY]) => borderHeight - 30 < buttonsRowY)
+            .debug(reached => console.log({ reached }));
 
         Object.keys(fields).forEach((key: keyof Decl) => {
             const isolatedDOMSource = isolateSource(DOM, key);
@@ -137,10 +173,11 @@ export function form<Decl extends FormDeclaration<any>>(
                 });
         });
 
-        const combined$: Stream<[Decl, FormRenderer<Decl>, ValidatorsFor<Decl>]> = Stream.combine(
+        const combined$: Stream<[Decl, FormRenderer<Decl>, ValidatorsFor<Decl>, boolean]> = Stream.combine(
             state.stream,
             renderer$,
             validators$,
+            reachedToBottom$,
         );
 
         const reducer$s: Stream<Endo<Values<Decl>>>[] = Object.keys(fields).map((key: keyof Decl) => {
@@ -163,7 +200,7 @@ export function form<Decl extends FormDeclaration<any>>(
         const reducer$: Stream<Endo<Values<Decl>>> = Stream.merge(...reducer$s);
 
         const vnode$: MemoryStream<VNode> = combined$
-            .map(([values, renderer, validators]) => {
+            .map(([values, renderer, validators, reached]) => {
                 const errors: Record<keyof Decl, string | null> = Object.keys(fields)
                     .map<[keyof Decl, string | null]>((key: keyof Decl) => {
                         const field: Field<Decl[keyof Decl]> | null | undefined = fields[key];
@@ -207,6 +244,31 @@ export function form<Decl extends FormDeclaration<any>>(
                             { valid: allValid },
                         );
 
+                        if (submitButtonField === key && reached) {
+                            const { data } = vnode;
+                            if (data) {
+                                const { class: classRecord } = data;
+                                if (classRecord) {
+                                    return [
+                                        key,
+                                        totalIsolateVNode(
+                                            {
+                                                ...vnode,
+                                                data: {
+                                                    ...data,
+                                                    class: {
+                                                        ...classRecord,
+                                                        [hoveringClassName]: true,
+                                                    },
+                                                },
+                                            },
+                                            (DOM as MainDOMSource).namespace,
+                                            key,
+                                        ),
+                                    ];
+                                }
+                            }
+                        }
                         return [key, totalIsolateVNode(vnode, (DOM as MainDOMSource).namespace, key)];
                     })
                     .reduce(
